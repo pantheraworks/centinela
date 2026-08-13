@@ -1,4 +1,4 @@
-name: Continuous Integration
+name: Test
 
 on:
   push:
@@ -31,13 +31,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@v1
+        uses: esp-rs/xtensa-toolchain@v1.5
         with:
-          toolchain: nightly
-          components: rust-src rustfmt clippy
+          default: true
+          buildtargets: esp32c3
+          ldproxy: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
-      - name: Install ldproxy
-        run: cargo install ldproxy
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
