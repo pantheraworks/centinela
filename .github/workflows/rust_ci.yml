@@ -1,4 +1,4 @@
-name: Test
+name: CI
 
 on:
   push:
@@ -14,18 +14,21 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  rust-checks:
-    name: Rust Checks
+  firmware:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        action:
-          - command: build
+        include:
+          - name: Build
+            command: build
             args: --release
-          - command: fmt
+          - name: Format
+            command: fmt
             args: --all -- --check --color always
-          - command: clippy
+          - name: Clippy
+            command: clippy
             args: --all-targets --all-features --workspace -- -D warnings
     steps:
       - name: Checkout repository
@@ -36,10 +39,28 @@ jobs:
         uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
+          buildtargets: esp32c3
           ldproxy: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
       - name: Run command
-        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+        run: cargo ${{ matrix.command }} ${{ matrix.args }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-tests
+      - name: Run tests
+        run: bash test.sh
