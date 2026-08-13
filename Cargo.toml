@@ -19,6 +19,7 @@ debug = true    # Symbols are nice, and they don't increase the size on Flash
 opt-level = "z"
 
 [dependencies]
+anyhow = "1.0.104"
 log = "0.4"
 
 [target.'cfg(target_os = "espidf")'.dependencies]
