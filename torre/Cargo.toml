@@ -1,0 +1,24 @@
+[package]
+name = "torre"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "torre"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+test = false
+
+[dependencies]
+centinela-core = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+centinela-esp = { workspace = true }
+esp-idf-svc = { workspace = true }
+embassy-time = { workspace = true }
+
+[build-dependencies]
+embuild = { workspace = true }

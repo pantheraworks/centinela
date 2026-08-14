@@ -1,15 +1,9 @@
 /// Initialize the ESP-IDF system environment and logging facilities.
-fn init_esp_idf() {
+pub fn init_esp_idf() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
-}
-
-fn main() {
-    init_esp_idf();
-
-    log::info!("{}", centinela::greeting());
 }

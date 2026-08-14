@@ -1,0 +1,27 @@
+[package]
+name = "centinela"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "centinela"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+test = false
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "onewire_bus", version = "^1.0.4" }
+
+[dependencies]
+centinela-core = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+centinela-esp = { workspace = true }
+esp-idf-svc = { workspace = true }
+embassy-time = { workspace = true }
+
+[build-dependencies]
+embuild = { workspace = true }

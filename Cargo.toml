@@ -1,15 +1,23 @@
-[package]
-name = "centinela"
+[workspace]
+members = ["core", "esp", "centinela", "torre"]
+default-members = ["core"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 authors = ["matias-gonz <maigonzalez@fi.uba.ar>"]
 edition = "2021"
-resolver = "2"
 rust-version = "1.82"
 
-[[bin]]
-name = "centinela"
-harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
-test = false
+[workspace.dependencies]
+centinela-core = { path = "core" }
+centinela-esp = { path = "esp" }
+anyhow = "1.0.104"
+log = "0.4"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+embuild = { version = "0.33", features = ["espidf"] }
 
 [profile.release]
 opt-level = "s"
@@ -17,15 +25,3 @@ opt-level = "s"
 [profile.dev]
 debug = true    # Symbols are nice, and they don't increase the size on Flash
 opt-level = "z"
-
-[dependencies]
-anyhow = "1.0.104"
-log = "0.4"
-
-[target.'cfg(target_os = "espidf")'.dependencies]
-esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
-# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
-embassy-time = { version = "0.5", features = ["generic-queue-8"] }
-
-[build-dependencies]
-embuild = { version = "0.33", features = ["espidf"] }

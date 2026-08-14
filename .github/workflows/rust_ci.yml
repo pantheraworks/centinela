@@ -17,21 +17,18 @@ env:
 
 jobs:
   firmware:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.firmware }} (${{ matrix.command }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        firmware: [centinela, torre]
+        command: [build, clippy]
         include:
-          - name: Build
-            command: build
+          - command: build
             args: --release
-          - name: Format
-            command: fmt
-            args: --all -- --check --color always
-          - name: Clippy
-            command: clippy
-            args: --all-targets --all-features --workspace -- -D warnings
+          - command: clippy
+            args: -p centinela-esp --all-targets -- -D warnings
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,8 +43,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.firmware }}
       - name: Run command
-        run: cargo ${{ matrix.command }} ${{ matrix.args }}
+        run: ./scripts/${{ matrix.firmware }}.sh ${{ matrix.command }} ${{ matrix.args }}
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check --color always
 
   test:
     name: Test
@@ -59,9 +72,14 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
+          components: clippy
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: host-tests
+      - name: Lint core
+        run: cargo +stable clippy -p centinela-core --all-targets --config 'unstable.build-std=[]' --target "$(rustc +stable -vV | awk '/^host:/{print $2}')" -- -D warnings
       - name: Run tests
         run: bash test.sh
+      - name: Check core has no ESP dependencies
+        run: bash scripts/check-core-deps.sh

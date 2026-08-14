@@ -1,0 +1,10 @@
+[package]
+name = "centinela-esp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+centinela-core = { workspace = true }
+esp-idf-svc = { workspace = true }
