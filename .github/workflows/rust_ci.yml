@@ -41,7 +41,6 @@ jobs:
         uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
-          buildtargets: esp32c3
           ldproxy: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,4 @@
-//! Setup the ESP-IDF system environment and logging facilities.
+/// Initialize the ESP-IDF system environment and logging facilities.
 fn init_esp_idf() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
