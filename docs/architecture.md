@@ -48,7 +48,7 @@ cargo tree -p centinela-core --edges normal --target all --prefix none | grep -q
 
 ### Domain types
 
-`Celsius` is a newtype over the DS18B20's native representation: a signed 16-bit value in 1/16 °C steps, which covers −55..125 °C losslessly. **Not `f32`.** The C3 is `riscv32imc` with no FPU, so every float operation is soft-float; fixed point also gives exact equality, which deduplication needs, and a portable wire encoding. Conversion to a display string happens in the screen adapter, not in core.
+`Celsius` is a newtype over the DS18B20's native representation: a signed 16-bit value in 1/16 °C steps, which covers −55..125 °C losslessly. **Not `f32`.** The C3 is `riscv32imc` with no FPU, so every float operation is soft-float; fixed point also gives exact equality, which deduplication needs, and a portable wire encoding. Rendering is `Display` on `Celsius` itself rather than a helper in an adapter: it is pure domain logic, it is host-testable, and as a `core::fmt` impl it needs no allocator, so it stays available to `no_std` callers and composes with `write!` and `log`.
 
 `Instant` is a monotonic `u64` millisecond count since boot, only ever compared or differenced. Points in time are `Instant`; durations are plain `u32` milliseconds. Keeping the two in separate types is what stops a deadline being passed where a delay was meant.
 
@@ -139,7 +139,11 @@ ESP-NOW already provides a link-layer CRC and a send-status acknowledgement, so 
 
 ### Pure decoding stays in core
 
-DS18B20 scratchpad parsing (`[u8; 9] -> Result<Celsius, ThermometerError>`, including the CRC-8 check) is a pure function with host tests. Adapters move bytes; they do not interpret them.
+DS18B20 scratchpad parsing lives in `core::ds18b20` — `parse_scratchpad(&[u8; 9]) -> Result<Celsius, ThermometerError>`, including the Dallas CRC-8 over all nine bytes, which is zero for a valid scratchpad. Adapters move bytes; they do not interpret them. The command bytes and the family code live there too, so the adapter names nothing magic.
+
+Device-specific decoding sits in its own module rather than beside the port, which stays generic: `Thermometer` says nothing about DS18B20, and a second part would add a module without touching it.
+
+The CRC check is also what detects a disconnected bus, with no special case: a floating line reads all `0xFF`, whose checksum does not come to zero. The 85 °C power-on value is deliberately *not* treated as an error — it is a legitimate temperature.
 
 ## Shared radio link
 
@@ -206,7 +210,11 @@ The current workflow breaks on the first day of the split: `cargo build --releas
 
 ## Hardware facts
 
-DS18B20 data line on GPIO0 with a 4.7 kΩ pull-up **to 3.3 V** (not 5 V — the C3 is not 5 V tolerant); VDD and pull-up both on 3.3 V.
+DS18B20 data line on GPIO4 with a 4.7 kΩ pull-up **to 3.3 V** (not 5 V — the C3 is not 5 V tolerant); VDD and pull-up both on 3.3 V. GPIO0 was the first choice but doubles as `XTAL_32K_P`, so a populated 32 kHz crystal would contend with the bus; the other pins to avoid are 2, 8 and 9 (strapping), 11 through 17 (flash and `VDD_SPI`), and 20 and 21 (console UART).
+
+**The external pull-up is not optional.** `OWDriver::new` builds its bus config with `flags: Default::default()`, leaving `en_pull_up` clear, so the component calls `gpio_set_pull_mode(pin, GPIO_FLOATING)` on a pin it has already switched to open drain. Nothing on the chip can drive the line high; the resistor is the only thing that does.
+
+The two electrical failures are distinguishable by error code, which makes bring-up much faster than guessing. A floating line never returns high, so the RMT receiver never observes the idle period that ends a reception, never completes, and `onewire_bus_rmt_reset` fails its one-second queue wait with `ESP_ERR_TIMEOUT`. A properly pulled-up line with no device answering *does* complete the reception and fails only the presence-pulse check, giving `ESP_ERR_NOT_FOUND`. So `ESP_ERR_TIMEOUT` on reset means wiring — missing pull-up, DQ shorted low, or VDD and GND reversed — while `ESP_ERR_NOT_FOUND` means the bus is electrically alive but the sensor is not responding.
 
 The 1-Wire driver is `esp_idf_svc::hal::onewire` (`OWDriver`, `OWAddress`, `OWCommand`), which only exists when the `onewire_bus` remote component is declared:
 
@@ -218,7 +226,7 @@ remote_component = { name = "onewire_bus", version = "^1.0.4" }
 Adding it requires `cargo clean` before the module appears. Opening the bus and discovering the single sensor is two calls, the doubled `?` being because `search()` yields `Result` items:
 
 ```rust
-let mut bus = OWDriver::new(peripherals.pins.gpio0)?;
+let mut bus = OWDriver::new(peripherals.pins.gpio4)?;
 let address = bus.search()?.next().context("no device on 1-Wire bus")??;
 ```
 
@@ -238,15 +246,17 @@ In place:
 - All four crates exist: `core/`, `esp/`, `centinela/`, `torre/`. Profiles and `default-members` at the root, per-firmware build scripts over a shared `scripts/firmware.sh`, the host test script, the core dependency fitness check, and a CI matrix over firmware × command.
 - Each firmware builds into `target/<package>/` with `ESP_IDF_SYS_ROOT_CRATE` and `CARGO_WORKSPACE_DIR` set by its script. The two firmwares already differ in `extra_components` — `onewire_bus` for `centinela` only — so their ESP-IDF builds diverge and a shared target directory would rebuild it on every switch.
 - `centinela-esp` holds `init_esp_idf()`, called by both firmware binaries.
-- Core holds exactly three things: `Celsius`, `ThermometerError`, and the `Thermometer` port. Host tests cover the DS18B20 datasheet conversion table.
+- Core holds `Celsius` with its `Display` impl, `ThermometerError`, the `Thermometer` port, and `ds18b20::parse_scratchpad`. Host tests cover the datasheet conversion table, the power-on scratchpad, negative temperatures, a corrupted byte, a wrong checksum, a floating bus, and the rendered form either side of zero.
+- `centinela::ds18b20::Ds18b20` implements `Thermometer` over `esp_idf_svc::hal::onewire`: it opens the bus at construction, then on the first read takes the first device the search yields and rejects a non-`0x28` family code as `NotPresent`, and per read issues `MatchRom` plus convert, waits out the conversion, re-addresses, reads nine bytes, and hands them to core. `EspError` is logged and mapped to a domain class at that boundary.
+- `centinela`'s `main` reads once a second and logs the value or the error class, and that loop *is* the retry policy: nothing after `Peripherals::take` is fatal. The split is that `Ds18b20::new` only opens the RMT bus, which fails solely on a bad pin or an exhausted RMT channel and so is genuinely fatal, while device discovery is lazy and cached inside the adapter. A read with no cached address enumerates first; any failure other than `Crc` clears the cache, since a CRC failure proves the transport is working whereas the rest cast doubt on the address itself. The practical effect is that the node survives a sensor that is missing at boot and starts reporting when the wiring is fixed, without a reflash.
 
 Deliberately absent, so that each item lands with the code that needs it:
 
-- **No adapter.** Both firmwares initialise ESP-IDF and logging and nothing else. Nothing implements `Thermometer`, and `centinela-esp` has no `EspError` mapping or radio link yet. The dependency edges are declared, so the next slice only adds code.
-- **No `Clock`, no `Instant`, no services.** They are described above as the shape to reach for, not as code that exists. A `Sampler` state machine did exist and was deleted along with its timing tests when the port stopped being two-phase; the logic it scheduled now belongs to a thread.
-- **No screen, button, or uplink. No wire protocol and no scratchpad parsing.** `torre` is a skeleton binary: the gateway service, `Uplink`, and `Publisher` arrive with the radio link.
+- **No `Clock`, no `Instant`, no services, no bundle.** They are described above as the shape to reach for, not as code that exists. A `Sampler` state machine did exist and was deleted along with its timing tests when the port stopped being two-phase; the cadence it scheduled is now a `delay_ms` in `main`.
+- **No screen, button, or uplink, and no policy.** Nothing retries, deduplicates, or holds a last-good reading. `main` is a loop that reads and logs, which is the smallest thing that gets a number off the hardware.
+- **No wire protocol.** `torre` is a skeleton binary: the gateway service, `Uplink`, and `Publisher` arrive with the radio link.
 
-The next step is reading an actual value off the DS18B20: the `Thermometer` implementation in `centinela`, the scratchpad parse and CRC-8 in core, and `main` logging what comes back. Policy comes after that, informed by what the hardware actually does.
+Two details about the adapter worth knowing before changing it. The conversion wait is a `FreeRtos::delay_ms(750)` inside `read`, hardcoded for 12-bit resolution — the device is never reconfigured, so it is the correct constant, but it belongs to whoever writes the resolution register if that ever happens. And the temperature formatting in `main` is sign-aware integer arithmetic rather than a float, because `-0.5 °C` would otherwise print as `0.500`; that logic moves into the screen adapter when there is one.
 - **`esp_idf_sdkconfig_defaults` is still not declared.** The trigger for the explicit path-prefixed lists is the first setting that has to differ *between* firmwares, not the existence of the second firmware. Until then both correctly resolve the shared `sdkconfig.defaults` at the workspace root, and inventing role files with no settings in them would only obscure that. When the gateway needs its WiFi and MQTT configuration, both manifests get the full list at once — a role file added without the corresponding manifest entry is silently ignored, since the default is a single bare path.
 
 Ports carry no doc comments, by project convention; their contracts live here. For the temperature port there is only one: `read` blocks for as long as the conversion takes and returns a value or an error. The adapter is where an `EspError` gets logged before being mapped, since the domain error keeps only the class.

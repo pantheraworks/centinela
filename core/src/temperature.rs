@@ -1,3 +1,5 @@
+use core::fmt;
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,6 +31,16 @@ impl Celsius {
 
     pub const fn whole_degrees(self) -> i16 {
         self.0 / 16
+    }
+}
+
+impl fmt::Display for Celsius {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let millidegrees = self.millidegrees();
+        let sign = if millidegrees < 0 { "-" } else { "" };
+        let magnitude = millidegrees.unsigned_abs();
+
+        write!(f, "{sign}{}.{:03} °C", magnitude / 1000, magnitude % 1000)
     }
 }
 
@@ -102,6 +114,26 @@ mod tests {
         assert_eq!(Celsius::from_sixteenths(401).whole_degrees(), 25);
         assert_eq!(Celsius::from_sixteenths(-401).whole_degrees(), -25);
         assert_eq!(Celsius::ZERO.whole_degrees(), 0);
+    }
+
+    #[test]
+    fn display_renders_three_decimal_places() {
+        assert_eq!(Celsius::from_sixteenths(0x0191).to_string(), "25.063 °C");
+        assert_eq!(Celsius::ZERO.to_string(), "0.000 °C");
+        assert_eq!(Celsius::from_sixteenths(0x07D0).to_string(), "125.000 °C");
+    }
+
+    #[test]
+    fn display_keeps_the_sign_below_zero() {
+        assert_eq!(
+            Celsius::from_sixteenths(0xFF5Eu16 as i16).to_string(),
+            "-10.125 °C"
+        );
+        assert_eq!(Celsius::from_sixteenths(-1).to_string(), "-0.063 °C");
+        assert_eq!(
+            Celsius::from_sixteenths(0xFC90u16 as i16).to_string(),
+            "-55.000 °C"
+        );
     }
 
     #[test]
