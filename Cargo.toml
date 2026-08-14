@@ -13,6 +13,7 @@ rust-version = "1.82"
 centinela-core = { path = "core" }
 centinela-esp = { path = "esp" }
 anyhow = "1.0.104"
+thiserror = { version = "2.0.20", default-features = false }
 log = "0.4"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`

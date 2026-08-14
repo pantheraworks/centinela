@@ -3,4 +3,4 @@
 
 pub mod temperature;
 
-pub use temperature::{Celsius, SensorError, TemperatureSensor, CONVERSION_MS};
+pub use temperature::{Celsius, Thermometer, ThermometerError};

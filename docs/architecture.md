@@ -12,7 +12,7 @@ Hexagonal (ports and adapters). Dependency direction points inward: adapters dep
 ## Recorded decisions
 
 - **The sensor is mains/USB powered.** It is always on, so a long-lived `tick()` loop is valid and sequence counters live in RAM. If this ever changes to battery with deep sleep, the loop model breaks: `seq` and dedup state would have to survive reboots in RTC slow memory and the core would stop being a loop. Revisit this document before adding deep sleep.
-- **Ports stay traits, with two corrections to their shape**: the temperature port is two-phase, and both application services accept a time-driven entry point. See below.
+- **Ports stay traits, and they block.** ESP-IDF gives us `std`, so `std::thread` maps to FreeRTOS tasks and a blocking wait yields the CPU rather than spinning. A thermometer read that takes 750 ms in its own task freezes nothing; concurrency comes from the RTOS, not from a cooperative loop in core. An earlier revision of this document specified a two-phase temperature port and a tick-driven scheduler in core to avoid blocking. That was solving a problem the RTOS already solves.
 - **The real driver for the workspace split is build isolation, not host testability.** `esp-idf-svc` is already target-gated in the current manifest and `test.sh` already defeats `build-std`; host tests break today only because `src/devices.rs` imports `esp_idf_svc` unconditionally from the library, which a `cfg` attribute would fix. What genuinely cannot work in one package is two firmwares needing two different ESP-IDF configurations. Host-test speed is a real but secondary benefit.
 
 ## Crate layout
@@ -39,8 +39,10 @@ Set `default-members = ["core"]` at the root so a bare `cargo build` or `cargo t
 An architecture rule that isn't machine-checked becomes a comment. CI asserts that the core's dependency tree contains no ESP crates:
 
 ```bash
-! cargo tree -p centinela-core --edges normal --prefix none | grep -qE '^(esp-|embuild)'
+cargo tree -p centinela-core --edges normal --target all --prefix none | grep -qE '^(esp-|embuild|embassy)'
 ```
+
+`--target all` is what makes it airtight: without it, an ESP dependency hidden behind a `cfg(target_os = "espidf")` gate would pass the check on a host.
 
 ## Core
 
@@ -48,54 +50,69 @@ An architecture rule that isn't machine-checked becomes a comment. CI asserts th
 
 `Celsius` is a newtype over the DS18B20's native representation: a signed 16-bit value in 1/16 °C steps, which covers −55..125 °C losslessly. **Not `f32`.** The C3 is `riscv32imc` with no FPU, so every float operation is soft-float; fixed point also gives exact equality, which deduplication needs, and a portable wire encoding. Conversion to a display string happens in the screen adapter, not in core.
 
-`Millis` is a monotonic `u64` millisecond count, only ever compared as a difference.
+`Instant` is a monotonic `u64` millisecond count since boot, only ever compared or differenced. Points in time are `Instant`; durations are plain `u32` milliseconds. Keeping the two in separate types is what stops a deadline being passed where a delay was meant.
 
 `Reading { node_id, boot_id, seq, celsius }`.
 
 ### Errors
 
-Every port that can fail returns `Result` with a domain error enum owned by core — `SensorError { NotPresent, Crc, Timeout }`, `ScreenError`, `UplinkError`, `PublishError`. `centinela-esp` maps `EspError` into these. Infallible port signatures force adapters to panic or fabricate values, which is precisely the behaviour that cannot be tested.
+Every port that can fail returns `Result` with a domain error enum owned by core, named after its port — `ThermometerError { NotPresent, Crc, Timeout, Bus }`, `ScreenError`, `UplinkError`, `PublishError`. Naming them after the port rather than the role is deliberate: "sensor" already means the node, so a `SensorError` would read as an error of the whole device. Infallible port signatures force adapters to panic or fabricate values, which is precisely the behaviour that cannot be tested.
+
+**`thiserror` in core, `anyhow` in the binaries.** They are not alternatives; they belong to different layers. Core's errors must be typed and matchable because the *policy* lives in core — "retry a `Crc`, treat `NotPresent` as fatal for this cycle" is only expressible over a closed set of variants, and `anyhow::Error` is type-erased, so core would have to downcast to make a decision it should be making directly. `thiserror` is a derive macro that generates exactly the `Display` and `Error` impls we would otherwise write by hand, so it does not appear in the API. It is declared with `default-features = false`, which targets `core::error::Error` and keeps core `no_std`; `anyhow` would additionally want `alloc` and a global allocator.
+
+The firmware binaries and adapters use `anyhow`, where type erasure is the point: `main` and setup code only log and bail.
+
+**No port ever returns `anyhow::Error`, and no core error carries an `EspError`.** The adapter boundary is where translation happens, and it is deliberately explicit rather than a `#[from]` impl: a single `EspError` can mean `Timeout` or `Bus` depending on context, so the adapter matches, logs the underlying code for the serial console, and returns the domain class. A blanket `From` would both lose that distinction and drag ESP types into core.
 
 ### Ports
 
 Phrased in domain terms, no hardware types in signatures:
 
 ```rust
-trait TemperatureSensor {
-    fn start_conversion(&mut self) -> Result<(), SensorError>;
-    fn read_conversion(&mut self) -> Result<Celsius, SensorError>;
+trait Thermometer {
+    fn read(&mut self) -> Result<Celsius, ThermometerError>;
 }
 
 trait Screen  { fn show(&mut self, view: &SensorView) -> Result<(), ScreenError>; }
 trait Button  { fn is_pressed(&mut self) -> bool; }
-trait Clock   { fn now_ms(&self) -> Millis; fn sleep_ms(&mut self, ms: u32); }
+trait Clock   { fn now(&self) -> Instant; }
 trait Uplink  { fn send_reading(&mut self, reading: &Reading) -> Result<(), UplinkError>; }
 trait Publisher { fn publish(&mut self, reading: &Reading) -> Result<(), PublishError>; }
 ```
 
-**The temperature port is two-phase because the hardware is.** A 12-bit DS18B20 conversion takes 750 ms; a blocking `read() -> Celsius` freezes the button and the screen for three quarters of a second per sample. Core owns the `CONVERSION_MS` constant and decides when enough time has elapsed. Port shape follows the device rather than flattening it.
+**`Thermometer::read` blocks and returns either a value or an error.** Everything about how the reading is obtained is internal to the adapter: issuing the convert command, waiting out the roughly 94 to 750 ms the configured resolution implies, reading the scratchpad, checking the CRC. Resolution never becomes a value core has to receive and reason about, and there is no ordering contract for a caller to get wrong.
 
-**`Clock` exposes `now_ms()`, not just `sleep_ms()`.** Conversion timing, deduplication windows, and retry backoff all need a monotonic reading; with only `sleep_ms` none of them can be tested without real sleeps, which defeats the point of the port.
+**Whoever calls `read` decides what the result means.** Sampling cadence, whether a `Crc` failure is retried, what a stale reading does to the screen — none of that belongs to the port, and none of it is designed yet.
+
+**`Clock` has only `now()`.** Sleeping belongs to whoever owns the thread. Core needs to know what time it is, for reading timestamps and retry backoff, not how to wait.
 
 **`Screen::show` takes a domain view struct, not a string.** Formatting and layout are adapter concerns, and a `&str` argument would drag `alloc` into core.
 
 **WiFi is not a port.** The port is `Publisher`. Association, DHCP, and session handling are implementation details inside the adapter. A WiFi trait would leak infrastructure into the domain.
 
-### Devices bundle
+### Injecting ports
 
-A `Devices` trait with associated types bundles the per-role ports so application structs carry one generic parameter instead of five. The firmware crates provide the concrete implementation. The **test** bundle is a plain struct generic over its ports, so a fake sensor can be combined with a real clock without writing a new impl for every combination — with associated types alone, partial fakes are combinatorial.
+There is no bundle type yet, because nothing in core takes more than one port. When a service does need several, two decisions are already made:
+
+**A plain generic struct with public fields, not a trait with accessors.** An accessor trait fails on borrows: a `&mut self` getter means nothing else on the bundle can be touched while its result is alive, so touching two ports in consecutive lines needs temporaries, scopes, or a `split()`. Struct fields are borrow-checked independently.
+
+**Ports passed as arguments, not held as fields.** Services own state and policy only, so they carry no type parameters and the generics live on the methods. Tests keep ownership of their fakes and can assert on them afterwards.
+
+Trait objects would also work and are deliberately not used: everything here is monomorphised.
 
 ### Sensor service
 
-Loop-driven `tick()`. State machine: idle → conversion started at `t` → conversion readable at `t + CONVERSION_MS` → send. The button and screen are serviced on every tick regardless of conversion state, which is what the two-phase port buys.
+Not designed yet, and deliberately not. The sensor thread calls `Thermometer::read` and gets a value or an error; what it does with either — cadence, retry, what the screen shows, when to uplink — is the next thing to work out, once a reading has actually come off the hardware.
+
+The shape it will take is a thread in `centinela` calling into core for decisions, rather than logic spread across tasks behind shared state. Threads wait; one thread decides. The interesting failures are sequencing failures, and those are exhaustively testable inside a struct and merely observable across threads.
 
 ### Gateway service
 
 Driven from outside, but by **two** entry points:
 
 ```rust
-fn on_reading(&mut self, reading: Reading, now: Millis);
-fn on_tick(&mut self, now: Millis);
+fn on_reading(&mut self, reading: Reading, now: Instant);
+fn on_tick(&mut self, now: Instant);
 ```
 
 `on_reading` alone is insufficient: buffering and retry must fire in the *absence* of input. If an uplink fails and the sensor then goes quiet, nothing would ever call `on_reading` again and buffered readings would sit forever. The gateway loop does a receive with timeout and dispatches to whichever applies. Both are directly callable in tests with fabricated times.
@@ -110,7 +127,7 @@ Key is `(node_id, boot_id, seq)`. `boot_id` is randomised once per sensor boot a
 
 ### Buffering and retry
 
-Bounded ring buffer of readings, drop-oldest on overflow. `on_reading` enqueues then attempts a flush; `on_tick` attempts a flush when the backoff interval has elapsed. Backoff is exponential with a cap, all driven by `Millis` arguments.
+Bounded ring buffer of readings, drop-oldest on overflow. `on_reading` enqueues then attempts a flush; `on_tick` attempts a flush when the backoff interval has elapsed. Backoff is exponential with a cap, all driven by `Instant` arguments.
 
 ### Wire protocol
 
@@ -122,7 +139,7 @@ ESP-NOW already provides a link-layer CRC and a send-status acknowledgement, so 
 
 ### Pure decoding stays in core
 
-DS18B20 scratchpad parsing (`[u8; 9] -> Result<Celsius, SensorError>`, including the CRC-8 check) is a pure function with host tests. Adapters move bytes; they do not interpret them.
+DS18B20 scratchpad parsing (`[u8; 9] -> Result<Celsius, ThermometerError>`, including the CRC-8 check) is a pure function with host tests. Adapters move bytes; they do not interpret them.
 
 ## Shared radio link
 
@@ -221,15 +238,18 @@ In place:
 - All four crates exist: `core/`, `esp/`, `centinela/`, `torre/`. Profiles and `default-members` at the root, per-firmware build scripts over a shared `scripts/firmware.sh`, the host test script, the core dependency fitness check, and a CI matrix over firmware × command.
 - Each firmware builds into `target/<package>/` with `ESP_IDF_SYS_ROOT_CRATE` and `CARGO_WORKSPACE_DIR` set by its script. The two firmwares already differ in `extra_components` — `onewire_bus` for `centinela` only — so their ESP-IDF builds diverge and a shared target directory would rebuild it on every switch.
 - `centinela-esp` holds `init_esp_idf()`, called by both firmware binaries.
-- The temperature interface in core: `Celsius`, `SensorError`, `CONVERSION_MS`, and the two-phase `TemperatureSensor` port, with host tests over the DS18B20 datasheet conversion table.
+- Core holds exactly three things: `Celsius`, `ThermometerError`, and the `Thermometer` port. Host tests cover the DS18B20 datasheet conversion table.
 
 Deliberately absent, so that each item lands with the code that needs it:
 
-- **No adapter wiring.** Both firmwares initialise ESP-IDF and logging and nothing else. Nothing implements `TemperatureSensor`, there is no `Devices` bundle, and `centinela-esp` has no `EspError` mapping or radio link yet. The dependency edges are declared, so the next slice only adds code.
-- **No `Clock` port, no application services, no wire protocol, no scratchpad parsing.** `torre` is a skeleton binary: the gateway service, `Uplink`, and `Publisher` arrive with the radio link.
+- **No adapter.** Both firmwares initialise ESP-IDF and logging and nothing else. Nothing implements `Thermometer`, and `centinela-esp` has no `EspError` mapping or radio link yet. The dependency edges are declared, so the next slice only adds code.
+- **No `Clock`, no `Instant`, no services.** They are described above as the shape to reach for, not as code that exists. A `Sampler` state machine did exist and was deleted along with its timing tests when the port stopped being two-phase; the logic it scheduled now belongs to a thread.
+- **No screen, button, or uplink. No wire protocol and no scratchpad parsing.** `torre` is a skeleton binary: the gateway service, `Uplink`, and `Publisher` arrive with the radio link.
+
+The next step is reading an actual value off the DS18B20: the `Thermometer` implementation in `centinela`, the scratchpad parse and CRC-8 in core, and `main` logging what comes back. Policy comes after that, informed by what the hardware actually does.
 - **`esp_idf_sdkconfig_defaults` is still not declared.** The trigger for the explicit path-prefixed lists is the first setting that has to differ *between* firmwares, not the existence of the second firmware. Until then both correctly resolve the shared `sdkconfig.defaults` at the workspace root, and inventing role files with no settings in them would only obscure that. When the gateway needs its WiFi and MQTT configuration, both manifests get the full list at once — a role file added without the corresponding manifest entry is silently ignored, since the default is a single bare path.
 
-Ports carry no doc comments, by project convention; their contracts live here. For the temperature port: `read_conversion` is only valid `CONVERSION_MS` after `start_conversion`, and an early call is a `SensorError::Timeout` from the adapter rather than a panic.
+Ports carry no doc comments, by project convention; their contracts live here. For the temperature port there is only one: `read` blocks for as long as the conversion takes and returns a value or an error. The adapter is where an `EspError` gets logged before being mapped, since the domain error keeps only the class.
 
 ## Deferred
 

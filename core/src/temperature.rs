@@ -1,4 +1,4 @@
-pub const CONVERSION_MS: u32 = 750;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Celsius(i16);
@@ -32,32 +32,20 @@ impl Celsius {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SensorError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ThermometerError {
+    #[error("no sensor present on the bus")]
     NotPresent,
+    #[error("sensor payload failed its checksum")]
     Crc,
+    #[error("sensor did not respond in time")]
     Timeout,
+    #[error("sensor bus failure")]
     Bus,
 }
 
-impl core::fmt::Display for SensorError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let message = match self {
-            Self::NotPresent => "no sensor present on the bus",
-            Self::Crc => "sensor payload failed its checksum",
-            Self::Timeout => "sensor did not respond in time",
-            Self::Bus => "sensor bus failure",
-        };
-        f.write_str(message)
-    }
-}
-
-impl core::error::Error for SensorError {}
-
-pub trait TemperatureSensor {
-    fn start_conversion(&mut self) -> Result<(), SensorError>;
-
-    fn read_conversion(&mut self) -> Result<Celsius, SensorError>;
+pub trait Thermometer {
+    fn read(&mut self) -> Result<Celsius, ThermometerError>;
 }
 
 #[cfg(test)]
