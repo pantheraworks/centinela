@@ -1,5 +1,6 @@
 use centinela_core::ds18b20::{
-    parse_scratchpad, CONVERT_TEMPERATURE, FAMILY_CODE, READ_SCRATCHPAD, SCRATCHPAD_LEN,
+    parse_scratchpad, Resolution, ALARM_HIGH_DEFAULT, ALARM_LOW_DEFAULT, CONVERT_TEMPERATURE,
+    FAMILY_CODE, READ_SCRATCHPAD, SCRATCHPAD_LEN, WRITE_SCRATCHPAD,
 };
 use centinela_core::{Celsius, Thermometer, ThermometerError};
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -7,18 +8,23 @@ use esp_idf_svc::hal::gpio::{InputPin, OutputPin};
 use esp_idf_svc::hal::onewire::{OWAddress, OWCommand, OWDriver};
 use esp_idf_svc::sys::{EspError, ESP_ERR_NOT_FOUND, ESP_ERR_TIMEOUT};
 
-const CONVERSION_MS: u32 = 800;
+const CONVERSION_MARGIN_MS: u32 = 50;
 
 pub struct Ds18b20<'d> {
     bus: OWDriver<'d>,
     address: Option<OWAddress>,
+    resolution: Resolution,
 }
 
 impl<'d> Ds18b20<'d> {
-    pub fn new(pin: impl InputPin + OutputPin + 'd) -> Result<Self, EspError> {
+    pub fn new(
+        pin: impl InputPin + OutputPin + 'd,
+        resolution: Resolution,
+    ) -> Result<Self, EspError> {
         Ok(Self {
             bus: OWDriver::new(pin)?,
             address: None,
+            resolution,
         })
     }
 
@@ -29,6 +35,8 @@ impl<'d> Ds18b20<'d> {
 
         let address = self.discover()?;
         log::info!("DS18B20 found at {:#018x}", address.address());
+
+        self.configure(address)?;
         self.address = Some(address);
 
         Ok(address)
@@ -58,11 +66,33 @@ impl<'d> Ds18b20<'d> {
         Ok(address)
     }
 
+    fn configure(&self, address: OWAddress) -> Result<(), ThermometerError> {
+        self.command(address, WRITE_SCRATCHPAD)
+            .map_err(|error| classify("write scratchpad", error))?;
+
+        self.bus
+            .write(&[
+                ALARM_HIGH_DEFAULT,
+                ALARM_LOW_DEFAULT,
+                self.resolution.config_byte(),
+            ])
+            .map_err(|error| classify("write scratchpad", error))?;
+
+        log::info!(
+            "resolution set to {:?}, {} ms per conversion, {} steps",
+            self.resolution,
+            self.resolution.conversion_ms(),
+            self.resolution.step()
+        );
+
+        Ok(())
+    }
+
     fn sample(&self, address: OWAddress) -> Result<Celsius, ThermometerError> {
         self.command(address, CONVERT_TEMPERATURE)
             .map_err(|error| classify("convert", error))?;
 
-        FreeRtos::delay_ms(CONVERSION_MS);
+        FreeRtos::delay_ms(self.resolution.conversion_ms() + CONVERSION_MARGIN_MS);
 
         self.command(address, READ_SCRATCHPAD)
             .map_err(|error| classify("read scratchpad", error))?;

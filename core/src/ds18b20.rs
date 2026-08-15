@@ -3,8 +3,49 @@ use crate::temperature::{Celsius, ThermometerError};
 pub const SCRATCHPAD_LEN: usize = 9;
 
 pub const CONVERT_TEMPERATURE: u8 = 0x44;
+pub const WRITE_SCRATCHPAD: u8 = 0x4E;
 pub const READ_SCRATCHPAD: u8 = 0xBE;
 pub const FAMILY_CODE: u8 = 0x28;
+
+pub const ALARM_HIGH_DEFAULT: u8 = 0x4B;
+pub const ALARM_LOW_DEFAULT: u8 = 0x46;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Resolution {
+    Bits9,
+    Bits10,
+    Bits11,
+    Bits12,
+}
+
+impl Resolution {
+    pub const fn config_byte(self) -> u8 {
+        match self {
+            Self::Bits9 => 0x1F,
+            Self::Bits10 => 0x3F,
+            Self::Bits11 => 0x5F,
+            Self::Bits12 => 0x7F,
+        }
+    }
+
+    pub const fn conversion_ms(self) -> u32 {
+        match self {
+            Self::Bits9 => 94,
+            Self::Bits10 => 188,
+            Self::Bits11 => 375,
+            Self::Bits12 => 750,
+        }
+    }
+
+    pub const fn step(self) -> Celsius {
+        Celsius::from_sixteenths(match self {
+            Self::Bits9 => 8,
+            Self::Bits10 => 4,
+            Self::Bits11 => 2,
+            Self::Bits12 => 1,
+        })
+    }
+}
 
 pub fn parse_scratchpad(scratchpad: &[u8; SCRATCHPAD_LEN]) -> Result<Celsius, ThermometerError> {
     if crc8(scratchpad) != 0 {
@@ -98,6 +139,35 @@ mod tests {
             parse_scratchpad(&scratchpad(0x50, 0x05, 0x1D)),
             Err(ThermometerError::Crc)
         );
+    }
+
+    #[test]
+    fn resolutions_match_the_datasheet_config_register() {
+        assert_eq!(Resolution::Bits9.config_byte(), 0x1F);
+        assert_eq!(Resolution::Bits10.config_byte(), 0x3F);
+        assert_eq!(Resolution::Bits11.config_byte(), 0x5F);
+        assert_eq!(Resolution::Bits12.config_byte(), 0x7F);
+    }
+
+    #[test]
+    fn conversion_time_halves_with_every_dropped_bit() {
+        assert_eq!(Resolution::Bits12.conversion_ms(), 750);
+        assert_eq!(Resolution::Bits11.conversion_ms(), 375);
+        assert_eq!(Resolution::Bits10.conversion_ms(), 188);
+        assert_eq!(Resolution::Bits9.conversion_ms(), 94);
+    }
+
+    #[test]
+    fn the_step_is_the_smallest_distinguishable_change() {
+        assert_eq!(Resolution::Bits12.step().millidegrees(), 63);
+        assert_eq!(Resolution::Bits11.step().millidegrees(), 125);
+        assert_eq!(Resolution::Bits10.step().millidegrees(), 250);
+        assert_eq!(Resolution::Bits9.step().millidegrees(), 500);
+    }
+
+    #[test]
+    fn the_reserved_tail_carries_the_configured_resolution() {
+        assert_eq!(TAIL[2], Resolution::Bits12.config_byte());
     }
 
     #[test]
