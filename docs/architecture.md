@@ -110,11 +110,17 @@ A service that needs several ports takes **a plain generic struct with public fi
 
 ### Sensor cycle
 
-One wake produces one reading. `main` opens the 1-Wire bus, takes a reading, logs it, and deep-sleeps the balance of a 30 s period through `DeepSleep::wakeup_on_timer`.
+One wake produces one reading. `main` opens the 1-Wire bus, takes a reading, logs it, and deep-sleeps the balance of a 10 s period through `DeepSleep::wakeup_on_timer`.
 
-The balance is computed from `esp_timer_get_time`, which counts from chip reset rather than from the start of `main`, so the roughly 300 ms of bootloader and init is charged against the period and the cadence holds at 30 s instead of drifting to 30 s plus the awake time.
+The balance is computed from `esp_timer_get_time`, which counts from chip reset rather than from the start of `main`, so the roughly 300 ms of bootloader and init is charged against the period and the cadence holds instead of drifting to the period plus the awake time.
 
-A failed read costs the node one cycle: it is logged, and the next wake is the retry. `Ds18b20::new` opens the RMT bus and nothing else, so it fails only on a bad pin or an exhausted RMT channel, both fatal. Device discovery is lazy: a read without a cached address enumerates the bus first, and any failure other than `Crc` clears the cache, since a CRC failure proves the transport works while the rest cast doubt on the address itself.
+A button on GPIO0, pulled up and shorted to ground when pressed, is armed as a second wake source through `DeepSleep::wakeup_on_gpio` at level low. Both wake sources run the same path, so a press produces a reading on demand and re-anchors the period from that boot; the cadence is a floor on sample age, not a schedule. Before sleeping, `main` waits for the pin to return high, otherwise a held button re-wakes the chip the instant it sleeps.
+
+A wake that is neither the timer nor the GPIO is a reset or a power-on, and `main` then idles for 10 s before sampling so a flash attempt has a window to catch the chip.
+
+A timer or button cycle is awake for roughly 600 ms, which is shorter than the second or more macOS needs to re-enumerate the USB-Serial-JTAG device after a sleep, so a monitor reopening the port usually misses the output: nothing is buffered for a host that is not yet attached. Steady-state cycles are therefore only intermittently observable over USB, and the reset path's window is what a monitor can rely on.
+
+A failed read costs the node one cycle: it is logged, and the next wake is the retry. Retrying within a wake would mean dropping the driver and reopening the bus, since a reset that fails with `ESP_ERR_TIMEOUT` leaves the RMT receive channel disabled and every later call on that driver returns `ESP_ERR_INVALID_STATE`. `Ds18b20::new` opens the RMT bus and nothing else, so it fails only on a bad pin or an exhausted RMT channel, both fatal. Device discovery is lazy: a read without a cached address enumerates the bus first, and any failure other than `Crc` clears the cache, since a CRC failure proves the transport works while the rest cast doubt on the address itself.
 
 A reset timeout poisons the bus object. `onewire_bus_rmt_reset` leaves the RMT receive channel disabled when its queue wait expires, and every subsequent call on that `OWDriver` fails with `ESP_ERR_INVALID_STATE`. Recovery is a new `OWDriver`, which the deep-sleep cycle provides for free by rebooting.
 
@@ -215,6 +221,8 @@ Both boards are ESP32-C3, so one workspace-root config covers `target`, `MCU`, l
 
 Host tests are `cargo test -p centinela-core --target <host triple>`, which pulls in neither `embuild` nor `esp-idf-sys`. `test.sh` carries the `--config 'unstable.build-std=[]'` override and host-triple detection, and includes integration tests under `core/tests/` and doc tests.
 
+`monitor.sh` reads the serial device directly rather than through `espflash monitor`, so it neither resets the chip nor dies when deep sleep drops the port; it waits for the device to reappear and resumes. Only one process can usefully read the port, and a reader that holds it starves espflash's handshake into a `Failed to connect`, so `firmware.sh` kills any running monitor and anything else holding `/dev/cu.usbmodem*` before it hands off to `cargo run`. The monitor forwards the signal to its `cat` child, since killing the loop alone would orphan a reader still holding the port.
+
 `rust-toolchain.toml` pins `channel = "esp"`. The C3 is RISC-V, so the `esp-rs/xtensa-toolchain` action is a misnomer here; it is used because it installs that channel and `ldproxy`.
 
 ### CI
@@ -226,7 +234,7 @@ Host tests are `cargo test -p centinela-core --target <host triple>`, which pull
 
 ## Hardware facts
 
-DS18B20 data line on GPIO4 with a 4.7 kΩ pull-up **to 3.3 V** (not 5 V — the C3 is not 5 V tolerant); VDD and pull-up both on 3.3 V. On the C3, avoid GPIO0 (`XTAL_32K_P`, which a populated 32 kHz crystal contends for), 2, 8 and 9 (strapping), 11 through 17 (flash and `VDD_SPI`), and 20 and 21 (console UART).
+DS18B20 data line on GPIO4 with a 4.7 kΩ pull-up **to 3.3 V** (not 5 V — the C3 is not 5 V tolerant); VDD and pull-up both on 3.3 V. Button on GPIO0 to ground, pulled up. On the C3, avoid GPIO2, 8 and 9 (strapping), 11 through 17 (flash and `VDD_SPI`), and 20 and 21 (console UART). Only GPIO0 through 5 are RTC-capable, so a deep-sleep wake pin has to be one of them; GPIO0 doubles as `XTAL_32K_P` and is free here because no 32 kHz crystal is populated.
 
 **The external pull-up is not optional.** `OWDriver::new` builds its bus config with `flags: Default::default()`, leaving `en_pull_up` clear, so the component calls `gpio_set_pull_mode(pin, GPIO_FLOATING)` on a pin it has already switched to open drain. Nothing on the chip drives the line high; the resistor is what does.
 
@@ -245,6 +253,6 @@ The HAL has no `Ds18b20` type; convert (`0x44`), write scratchpad (`0x4E`), and 
 
 A `WRITE_SCRATCHPAD` lands in the sensor's volatile scratchpad, so the adapter writes the resolution on every boot, which a deep-sleep cycle makes cheap. Surviving a sensor power cycle would take `COPY_SCRATCHPAD` (`0x48`) burning it into EEPROM, at the cost of write cycles.
 
-Deep sleep powers down the USB-Serial-JTAG peripheral, so the serial monitor drops on every cycle and a flash attempt has only the awake window to catch the chip. Holding **BOOT** (GPIO9) while tapping **RESET** enters download mode and holds it there.
+Deep sleep powers down the USB-Serial-JTAG peripheral, so the serial monitor drops on every cycle and a flash attempt has only the awake window to catch the chip. Holding **BOOT** (GPIO9) while tapping **RESET** enters download mode and holds it there regardless.
 
 On the gateway, WiFi and BLE share one radio. ESP-NOW alongside a WiFi station connection must run on the access point's channel, which means the sensor's channel is dictated by the gateway's AP — if the AP moves channel, the link breaks until the sensor follows. WiFi power save must be disabled on the gateway (`WIFI_PS_NONE`) or it will miss ESP-NOW frames while dozing.

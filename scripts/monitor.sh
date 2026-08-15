@@ -3,7 +3,16 @@ set -uo pipefail
 
 baud="${1:-115200}"
 
-trap 'echo; echo "monitor stopped"; exit 0' INT
+reader=""
+
+stop() {
+    [ -n "$reader" ] && kill "$reader" 2>/dev/null
+    echo
+    echo "monitor stopped"
+    exit 0
+}
+
+trap stop INT TERM
 
 while true; do
     port=""
@@ -13,7 +22,11 @@ while true; do
     done
 
     stty -f "$port" "$baud" raw -echo 2>/dev/null || true
-    cat "$port" 2>/dev/null || true
+
+    cat "$port" 2>/dev/null &
+    reader=$!
+    wait "$reader" 2>/dev/null || true
+    reader=""
 
     sleep 0.3
 done
