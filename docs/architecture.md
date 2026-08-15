@@ -110,7 +110,7 @@ A service that needs several ports takes **a plain generic struct with public fi
 
 ### Sensor cycle
 
-One wake produces one reading. `main` opens the 1-Wire bus, takes a reading, logs it, and deep-sleeps the balance of a 10 s period through `DeepSleep::wakeup_on_timer`.
+One wake produces one reading. `main` opens the 1-Wire bus, takes a reading, records it, and deep-sleeps the balance of a 10 s period through `DeepSleep::wakeup_on_timer`.
 
 The balance is computed from `esp_timer_get_time`, which counts from chip reset rather than from the start of `main`, so the roughly 300 ms of bootloader and init is charged against the period and the cadence holds instead of drifting to the period plus the awake time.
 
@@ -118,7 +118,19 @@ A button on GPIO0, pulled up and shorted to ground when pressed, is armed as a s
 
 A wake that is neither the timer nor the GPIO is a reset or a power-on, and `main` then idles for 10 s before sampling so a flash attempt has a window to catch the chip.
 
-A timer or button cycle is awake for roughly 600 ms, which is shorter than the second or more macOS needs to re-enumerate the USB-Serial-JTAG device after a sleep, so a monitor reopening the port usually misses the output: nothing is buffered for a host that is not yet attached. Steady-state cycles are therefore only intermittently observable over USB, and the reset path's window is what a monitor can rely on.
+A timer or button cycle is awake for roughly 600 ms, which is shorter than the second or more macOS needs to re-enumerate the USB-Serial-JTAG device after a sleep, so a monitor reopening the port usually misses the output. Steady-state cycles are therefore only intermittently observable over USB, and the reset path's window is what a monitor can rely on.
+
+### Cycle journal
+
+The cycle records what happened into a `LogBuffer` and emits it in one burst immediately before sleeping, rather than logging as it goes. One flush per wake is the shape the radio needs — a single ESP-NOW send carrying the cycle — so the console is the first of two drains behind the same buffer.
+
+`LogBuffer<N>` is a byte arena of fixed capacity: entries are appended as a three byte header of length and `Level`, then the UTF-8 text, and `entries()` walks them back as `(Level, &str)` pairs. No allocation, so it holds in core under `no_std`, and the size is the firmware's choice through the const parameter.
+
+Recording is transactional. `record` reserves the header, formats through a `Write` sink that refuses to copy past capacity, and on refusal rewinds the length and counts a drop. A full buffer therefore loses whole entries rather than truncating one mid-character, and `dropped()` reports how many, which keeps `entries()` free of partial UTF-8 without any unsafe slicing.
+
+`Level` is core's own two-variant enum, not the `log` crate's, so the buffer stays free of logging infrastructure; the firmware maps it onto `log::info!` and `log::warn!` when it drains.
+
+The operator-facing notice that the flash window is open is logged directly instead. It is a prompt to a host that is already attached during a reset boot, and buffering it would print it after the window it announces has closed.
 
 A failed read costs the node one cycle: it is logged, and the next wake is the retry. Retrying within a wake would mean dropping the driver and reopening the bus, since a reset that fails with `ESP_ERR_TIMEOUT` leaves the RMT receive channel disabled and every later call on that driver returns `ESP_ERR_INVALID_STATE`. `Ds18b20::new` opens the RMT bus and nothing else, so it fails only on a bad pin or an exhausted RMT channel, both fatal. Device discovery is lazy: a read without a cached address enumerates the bus first, and any failure other than `Crc` clears the cache, since a CRC failure proves the transport works while the rest cast doubt on the address itself.
 

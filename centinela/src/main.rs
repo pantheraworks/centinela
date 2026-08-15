@@ -3,7 +3,8 @@ mod ds18b20;
 use std::time::Duration;
 
 use centinela_core::ds18b20::Resolution;
-use centinela_core::Thermometer;
+use centinela_core::log_buffer::Level as Severity;
+use centinela_core::{LogBuffer, Thermometer};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{Level, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -20,6 +21,7 @@ const FLASH_WINDOW: Duration = Duration::from_secs(10);
 const MINIMUM_SLEEP: Duration = Duration::from_secs(1);
 const BUTTON_POLL_MS: u32 = 20;
 const RESOLUTION: Resolution = Resolution::Bits11;
+const JOURNAL_BYTES: usize = 512;
 
 fn main() -> anyhow::Result<()> {
     centinela_esp::init_esp_idf();
@@ -34,22 +36,24 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(FLASH_WINDOW);
     }
 
-    log::info!(
+    let mut journal = LogBuffer::<JOURNAL_BYTES>::new();
+
+    journal.info(format_args!(
         "woke on {}",
         match wakeup {
             WakeupReason::Timer => "timer",
             WakeupReason::Other(WAKEUP_GPIO) => "button",
             _ => "reset",
         }
-    );
+    ));
 
     let peripherals = Peripherals::take()?;
     let button = PinDriver::input(peripherals.pins.gpio0, Pull::Up)?;
     let mut thermometer = Ds18b20::new(peripherals.pins.gpio4, RESOLUTION)?;
 
     match thermometer.read() {
-        Ok(celsius) => log::info!("temperature: {celsius}"),
-        Err(error) => log::warn!("temperature unavailable: {error}"),
+        Ok(celsius) => journal.info(format_args!("temperature: {celsius}")),
+        Err(error) => journal.warn(format_args!("temperature unavailable: {error}")),
     }
 
     while button.is_low() {
@@ -59,16 +63,34 @@ fn main() -> anyhow::Result<()> {
     let awake = since_boot();
     let sleep_for = SAMPLE_PERIOD.saturating_sub(awake).max(MINIMUM_SLEEP);
 
-    log::info!(
+    journal.info(format_args!(
         "awake for {} ms, sleeping for {} ms",
         awake.as_millis(),
         sleep_for.as_millis()
-    );
+    ));
+
+    flush(&journal);
 
     DeepSleep::new()?
         .wakeup_on_timer(sleep_for)?
         .wakeup_on_gpio(&button, Level::Low)?
         .enter()
+}
+
+fn flush(journal: &LogBuffer<JOURNAL_BYTES>) {
+    for (severity, text) in journal.entries() {
+        match severity {
+            Severity::Info => log::info!("{text}"),
+            Severity::Warn => log::warn!("{text}"),
+        }
+    }
+
+    if journal.dropped() > 0 {
+        log::warn!(
+            "{} records did not fit in {JOURNAL_BYTES} bytes",
+            journal.dropped()
+        );
+    }
 }
 
 fn since_boot() -> Duration {
